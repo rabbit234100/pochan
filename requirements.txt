@@ -1,0 +1,6 @@
+streamlit
+beautifulsoup4
+openai
+pydantic
+playwright
+playwright-stealth
