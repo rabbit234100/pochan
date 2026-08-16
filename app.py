@@ -1,8 +1,7 @@
 import os
-os.system("playwright install chromium") #
+os.system("playwright install chromium") # 앱 실행 시 크롬 브라우저 자동 설치
 
 import streamlit as st
-import os
 import time
 import sqlite3
 import json
@@ -69,9 +68,10 @@ def scrape_post(url: str, user_cookie: str = None) -> str:
             viewport={"width": 1920, "height": 1080}
         )
         
+        # 🔑 수정됨: 쿠키 이름이 arca.session2 로 변경되었습니다.
         if user_cookie:
             context.add_cookies([
-                {"name": "arca_session", "value": user_cookie.strip(), "domain": ".arca.live", "path": "/"}
+                {"name": "arca.session2", "value": user_cookie.strip(), "domain": ".arca.live", "path": "/"}
             ])
             
         page = context.new_page()
@@ -123,10 +123,17 @@ def extract_giveaway_data(text: str, api_key: str) -> GiveawayExtraction:
 # --- 4. Streamlit UI 및 Secrets 설정 ---
 st.set_page_config(page_title="포켓몬 나눔 아카이브", layout="wide")
 
+# 🔑 수정됨: Secrets에서 Gemini API 키와 ARCA 쿠키를 모두 불러옵니다.
 try:
     gemini_api_key = st.secrets["GEMINI_API_KEY"]
 except KeyError:
     gemini_api_key = None
+
+try:
+    secret_arca_cookie = st.secrets["ARCA_COOKIE"]
+except KeyError:
+    secret_arca_cookie = None
+
 
 with st.sidebar:
     st.header("🔑 메뉴")
@@ -136,7 +143,7 @@ with st.sidebar:
         st.error("⚠️ 시스템 오류: 서버(Secrets)에 Gemini API 키가 설정되지 않았습니다.")
 
 # ----------------------------------------------------
-# [화면 1] 유저용 메인 화면 (내역 출력 삭제됨)
+# [화면 1] 유저용 메인 화면
 # ----------------------------------------------------
 if menu == "유저: 나눔 기록하기":
     st.title("🐾 포켓몬 나눔 자동 로거")
@@ -205,11 +212,10 @@ elif menu == "관리자: 일괄 처리 및 통계":
                 for log in pending_logs:
                     st.code(log["url"])
                     
-                admin_cookie = st.text_input("본인의 arca_session 쿠키 값을 입력하세요", type="password")
-                
-                if st.button("🔥 쿠키 장전 및 일괄 뚫기 실행", type="primary"):
-                    if not admin_cookie:
-                        st.error("쿠키를 입력해야 합니다.")
+                # 🔑 수정됨: 입력창 삭제하고 숨겨진 쿠키(secret_arca_cookie)를 바로 사용합니다.
+                if st.button("🔥 숨겨진 쿠키로 일괄 뚫기 실행", type="primary"):
+                    if not secret_arca_cookie:
+                        st.error("서버 Secrets에 ARCA_COOKIE가 설정되지 않았습니다. 셋팅을 확인해주세요.")
                     else:
                         progress_text = "일괄 크롤링 중입니다. 잠시만 대기해주세요..."
                         my_bar = st.progress(0, text=progress_text)
@@ -220,7 +226,7 @@ elif menu == "관리자: 일괄 처리 및 통계":
                             target_url = log["url"]
                             my_bar.progress((idx + 1) / total, text=f"처리 중: {target_url}")
                             
-                            raw_text = scrape_post(target_url, admin_cookie)
+                            raw_text = scrape_post(target_url, secret_arca_cookie)
                             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             
                             if "Error" not in raw_text and "로그인" not in raw_text:
