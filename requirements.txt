@@ -1,4 +1,5 @@
 streamlit
+curl_cffi
 beautifulsoup4
 google-generativeai
 pydantic
