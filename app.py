@@ -3,6 +3,7 @@ import os
 import time
 import sqlite3
 import json
+from datetime import datetime
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
@@ -27,32 +28,31 @@ class GiveawayExtraction(BaseModel):
     recipients: List[GiveawayRecipient]
 
 # --- 2. 데이터베이스 초기화 및 함수 ---
-# SQLite 데이터베이스 연결 (파일 형태로 서버에 저장됨)
+# 새 버전의 DB 생성 (날짜 기록용 created_at 컬럼 추가)
 def get_db_connection():
-    conn = sqlite3.connect('giveaway_logs.db', check_same_thread=False)
+    conn = sqlite3.connect('giveaway_logs_v2.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db_connection()
-    # url: 게시글 주소 / status: 상태(PENDING, COMPLETED, FAILED_AUTH) / data: LLM 추출 결과 JSON
     conn.execute('''
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT UNIQUE,
             status TEXT,
-            data TEXT
+            data TEXT,
+            created_at TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-init_db() # 앱 실행 시 DB가 없으면 생성
+init_db()
 
 # --- 3. 핵심 기능 함수 (크롤링 및 추출) ---
 def scrape_post(url: str, user_cookie: str = None) -> str:
     with sync_playwright() as p:
-        # 봇 탐지 방지 플래그(args) 추가
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -72,7 +72,6 @@ def scrape_post(url: str, user_cookie: str = None) -> str:
             ])
             
         page = context.new_page()
-        # webdriver 감지 비활성화 스크립트 주입
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         try:
@@ -121,25 +120,25 @@ def extract_giveaway_data(text: str, api_key: str) -> GiveawayExtraction:
 # --- 4. Streamlit UI 및 Secrets 설정 ---
 st.set_page_config(page_title="포켓몬 나눔 아카이브", layout="wide")
 
-# Streamlit 서버의 Secrets에서 Gemini API 키 불러오기
 try:
     gemini_api_key = st.secrets["GEMINI_API_KEY"]
 except KeyError:
     gemini_api_key = None
 
-# 사이드바 설정 및 메뉴 분리
 with st.sidebar:
     st.header("🔑 메뉴")
-    menu = st.radio("이동", ["유저: 나눔 기록하기", "관리자: 일괄 처리(Batch)"])
+    menu = st.radio("이동", ["유저: 나눔 기록하기", "관리자: 일괄 처리 및 통계"])
     
     if not gemini_api_key:
         st.error("⚠️ 시스템 오류: 서버(Secrets)에 Gemini API 키가 설정되지 않았습니다.")
 
 # ----------------------------------------------------
-# [화면 1] 유저용 메인 화면
+# [화면 1] 유저용 메인 화면 (내역 출력 삭제됨)
 # ----------------------------------------------------
 if menu == "유저: 나눔 기록하기":
     st.title("🐾 포켓몬 나눔 자동 로거")
+    st.markdown("나눔 받은 게시글의 링크를 입력하여 아카이브에 영구 기록하세요. (내역은 관리자만 열람 가능합니다)")
+    
     url_input = st.text_input("나눔 게시글 URL", placeholder="https://arca.live/b/pokemon/...")
     
     if st.button("내역 자동 추출하기", type="primary"):
@@ -148,110 +147,177 @@ if menu == "유저: 나눔 기록하기":
         elif url_input:
             with st.spinner("분석 중입니다..."):
                 conn = get_db_connection()
-                
-                # 이미 DB에 있는지 확인
                 existing = conn.execute('SELECT * FROM logs WHERE url = ?', (url_input,)).fetchone()
                 
                 if existing and existing["status"] == "COMPLETED":
-                    st.success("이미 분석이 완료되어 저장된 글입니다.")
+                    st.success("이미 분석이 완료되어 관리자 아카이브에 저장된 글입니다.")
                 else:
-                    # 쿠키 없이 크롤링 시도
                     raw_text = scrape_post(url_input)
+                    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     
                     if "Error" in raw_text or "로그인" in raw_text or "성인" in raw_text:
-                        # 막혔다면 DB에 FAILED_AUTH 상태로 대기열에 넣음
                         try:
-                            conn.execute('INSERT OR REPLACE INTO logs (url, status) VALUES (?, ?)', (url_input, "FAILED_AUTH"))
+                            conn.execute(
+                                'INSERT OR REPLACE INTO logs (url, status, created_at) VALUES (?, ?, ?)', 
+                                (url_input, "FAILED_AUTH", current_time)
+                            )
                             conn.commit()
                         except sqlite3.IntegrityError:
                             pass
-                        st.warning("⚠️ 인증이 필요한 글이거나 차단되었습니다. 관리자 대기열에 등록되었습니다. (나중에 자동 처리됩니다)")
+                        st.warning("⚠️ 인증이 필요한 글이거나 차단되었습니다. 관리자 대기열에 등록되었습니다.")
                     else:
-                        # 성공 시 데이터 추출 및 DB 저장
                         try:
                             extracted_data = extract_giveaway_data(raw_text, gemini_api_key)
                             conn.execute(
-                                'INSERT OR REPLACE INTO logs (url, status, data) VALUES (?, ?, ?)',
-                                (url_input, "COMPLETED", extracted_data.model_dump_json())
+                                'INSERT OR REPLACE INTO logs (url, status, data, created_at) VALUES (?, ?, ?, ?)',
+                                (url_input, "COMPLETED", extracted_data.model_dump_json(), current_time)
                             )
                             conn.commit()
-                            st.success("✅ 나눔 내역이 성공적으로 영구 저장되었습니다!")
+                            st.success("✅ 나눔 내역이 관리자 아카이브에 성공적으로 저장되었습니다!")
                         except Exception as e:
                             st.error(f"분석 중 오류 발생: {e}")
                 
                 conn.close()
 
-    # DB에 저장된 완료 내역 보여주기
-    st.markdown("---")
-    st.subheader("📚 최근 아카이브된 나눔 내역")
-    conn = get_db_connection()
-    completed_logs = conn.execute('SELECT * FROM logs WHERE status = "COMPLETED" ORDER BY id DESC LIMIT 5').fetchall()
-    
-    for log in completed_logs:
-        data = json.loads(log["data"])
-        with st.expander(f"👑 주최자 {data['host_username']} 님의 나눔 (게시글: {log['url']})"):
-            for recipient in data['recipients']:
-                pkmn_names = ", ".join([p["name"] for p in recipient["received_pokemon"]])
-                st.write(f"- 당첨자: **{recipient['username']}** 님 ➡️ 수령: {pkmn_names}")
-    conn.close()
-
 # ----------------------------------------------------
-# [화면 2] 관리자 전용 화면 (Batch Processing)
+# [화면 2] 관리자 전용 화면 (Batch + 통계 + 초기화)
 # ----------------------------------------------------
-elif menu == "관리자: 일괄 처리(Batch)":
-    st.title("🛠️ 관리자 대기열 일괄 처리")
+elif menu == "관리자: 일괄 처리 및 통계":
+    st.title("🛠️ 관리자 대시보드")
     
     admin_pw = st.text_input("관리자 비밀번호", type="password")
     
     if admin_pw == "rabbit777": 
-        conn = get_db_connection()
-        pending_logs = conn.execute('SELECT url FROM logs WHERE status = "FAILED_AUTH"').fetchall()
+        # 관리자 화면을 탭으로 분리
+        tab1, tab2 = st.tabs(["🚀 미처리 링크 일괄 뚫기", "📊 유저별 나눔 통계 및 데이터 관리"])
         
-        st.info(f"현재 인증 장벽에 막혀 대기 중인 링크: **{len(pending_logs)}개**")
-        
-        if pending_logs:
-            for log in pending_logs:
-                st.code(log["url"])
-                
-            admin_cookie = st.text_input("본인의 arca_session 쿠키 값을 입력하세요", type="password")
+        # --- 탭 1: 일괄 뚫기 ---
+        with tab1:
+            conn = get_db_connection()
+            pending_logs = conn.execute('SELECT url FROM logs WHERE status = "FAILED_AUTH"').fetchall()
             
-            if st.button("🔥 쿠키 장전 및 일괄 뚫기 실행", type="primary"):
-                if not admin_cookie:
-                    st.error("쿠키를 입력해야 합니다.")
-                elif not gemini_api_key:
-                    st.error("서버에 API 키가 설정되지 않았습니다.")
-                else:
-                    progress_text = "일괄 크롤링 중입니다. 잠시만 대기해주세요..."
-                    my_bar = st.progress(0, text=progress_text)
+            st.info(f"현재 인증 장벽에 막혀 대기 중인 링크: **{len(pending_logs)}개**")
+            
+            if pending_logs:
+                for log in pending_logs:
+                    st.code(log["url"])
                     
-                    success_count = 0
-                    total = len(pending_logs)
-                    
-                    for idx, log in enumerate(pending_logs):
-                        target_url = log["url"]
-                        my_bar.progress((idx + 1) / total, text=f"처리 중: {target_url}")
+                admin_cookie = st.text_input("본인의 arca_session 쿠키 값을 입력하세요", type="password")
+                
+                if st.button("🔥 쿠키 장전 및 일괄 뚫기 실행", type="primary"):
+                    if not admin_cookie:
+                        st.error("쿠키를 입력해야 합니다.")
+                    else:
+                        progress_text = "일괄 크롤링 중입니다. 잠시만 대기해주세요..."
+                        my_bar = st.progress(0, text=progress_text)
+                        success_count = 0
+                        total = len(pending_logs)
                         
-                        # 이번엔 관리자 쿠키를 넣고 강력하게 스크래핑 시도
-                        raw_text = scrape_post(target_url, admin_cookie)
-                        
-                        if "Error" not in raw_text and "로그인" not in raw_text:
-                            try:
-                                extracted_data = extract_giveaway_data(raw_text, gemini_api_key)
-                                conn.execute(
-                                    'UPDATE logs SET status = ?, data = ? WHERE url = ?',
-                                    ("COMPLETED", extracted_data.model_dump_json(), target_url)
-                                )
-                                conn.commit()
-                                success_count += 1
-                            except Exception as e:
-                                st.write(f"LLM 추출 실패 ({target_url}): {e}")
-                        else:
-                            st.write(f"크롤링 재실패 (삭제된 글이거나 만료된 쿠키): {target_url}")
+                        for idx, log in enumerate(pending_logs):
+                            target_url = log["url"]
+                            my_bar.progress((idx + 1) / total, text=f"처리 중: {target_url}")
                             
-                    my_bar.empty()
-                    st.success(f"🎉 일괄 처리 완료! 총 {total}개 중 {success_count}개 뚫기 성공.")
-                    time.sleep(2)
-                    st.rerun() # 화면 새로고침
-        conn.close()
+                            raw_text = scrape_post(target_url, admin_cookie)
+                            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            if "Error" not in raw_text and "로그인" not in raw_text:
+                                try:
+                                    extracted_data = extract_giveaway_data(raw_text, gemini_api_key)
+                                    conn.execute(
+                                        'UPDATE logs SET status = ?, data = ?, created_at = ? WHERE url = ?',
+                                        ("COMPLETED", extracted_data.model_dump_json(), current_time, target_url)
+                                    )
+                                    conn.commit()
+                                    success_count += 1
+                                except Exception as e:
+                                    st.write(f"LLM 추출 실패 ({target_url}): {e}")
+                            else:
+                                st.write(f"크롤링 재실패 (삭제된 글이거나 만료된 쿠키): {target_url}")
+                                
+                        my_bar.empty()
+                        st.success(f"🎉 일괄 처리 완료! 총 {total}개 중 {success_count}개 뚫기 성공.")
+                        time.sleep(2)
+                        st.rerun() 
+            conn.close()
+
+        # --- 탭 2: 나눔 내역 통계 및 관리 ---
+        with tab2:
+            st.subheader("📚 유저별 나눔 수령 현황")
+            st.caption("※ 동일 날짜 2회 초과(3회 이상), 동일 주간 5회 초과(6회 이상) 수령 유저는 닉네임이 빨간색으로 표시됩니다.")
+            
+            conn = get_db_connection()
+            completed_logs = conn.execute('SELECT * FROM logs WHERE status = "COMPLETED" ORDER BY id DESC').fetchall()
+            
+            user_stats = {}
+            weekdays_ko = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+            
+            # 1. 데이터 집계
+            for log in completed_logs:
+                data = json.loads(log["data"])
+                date_str_full = log["created_at"] if log["created_at"] else "2026-01-01 00:00:00"
+                
+                try:
+                    dt = datetime.strptime(date_str_full, "%Y-%m-%d %H:%M:%S")
+                except:
+                    dt = datetime.now()
+                    
+                date_key = dt.strftime("%Y-%m-%d") # 날짜 (예: 2026-08-17)
+                week_key = dt.strftime("%Y-%W")    # 연도-주차 (예: 2026-34)
+                weekday_name = weekdays_ko[dt.weekday()] # 요일
+                
+                for recipient in data['recipients']:
+                    uname = recipient["username"]
+                    if uname not in user_stats:
+                        user_stats[uname] = {
+                            "total": 0, "by_date": {}, "by_week": {}, 
+                            "weekdays": {w: 0 for w in weekdays_ko}, "history": []
+                        }
+                    
+                    user_stats[uname]["total"] += 1
+                    user_stats[uname]["by_date"][date_key] = user_stats[uname]["by_date"].get(date_key, 0) + 1
+                    user_stats[uname]["by_week"][week_key] = user_stats[uname]["by_week"].get(week_key, 0) + 1
+                    user_stats[uname]["weekdays"][weekday_name] += 1
+                    
+                    pkmns = ", ".join([p["name"] for p in recipient["received_pokemon"]])
+                    user_stats[uname]["history"].append(f"[{date_key} {weekday_name}] {pkmns} (주최: {data['host_username']}) - 🔗 [링크]({log['url']})")
+            
+            # 2. 화면 출력 및 규정 검사
+            for uname, stats in user_stats.items():
+                # 규정 위반 체크 (하루 2회 초과 OR 주간 5회 초과)
+                over_daily = any(count > 2 for count in stats["by_date"].values())
+                over_weekly = any(count > 5 for count in stats["by_week"].values())
+                
+                if over_daily or over_weekly:
+                    display_name = f":red[{uname} 🚨 (규정 초과)]"
+                else:
+                    display_name = f"{uname}"
+                    
+                with st.expander(f"👤 {display_name} - 총 {stats['total']}회 수령"):
+                    # 요일별 수령 내역
+                    weekday_texts = [f"{w} {stats['weekdays'][w]}회" for w in weekdays_ko if stats['weekdays'][w] > 0]
+                    st.markdown(f"**[요일별 누적 수령]** {', '.join(weekday_texts)}")
+                    
+                    # 상세 기록
+                    st.markdown("**[상세 내역]**")
+                    for h in stats["history"]:
+                        st.write(f"- {h}")
+                        
+            if not user_stats:
+                st.info("아직 저장된 나눔 완료 내역이 없습니다.")
+                
+            # 3. 데이터 초기화 버튼
+            st.markdown("---")
+            st.subheader("🚨 데이터 초기화 구역")
+            st.warning("이 버튼을 누르면 서버에 저장된 모든 나눔 기록 및 대기열 데이터가 영구적으로 삭제됩니다.")
+            
+            if st.button("모든 나눔 데이터 삭제", type="primary"):
+                conn.execute('DELETE FROM logs')
+                conn.commit()
+                st.success("✅ 모든 데이터가 성공적으로 초기화되었습니다.")
+                time.sleep(1.5)
+                st.rerun()
+                
+            conn.close()
+            
     elif admin_pw:
         st.error("비밀번호가 틀렸습니다.")
