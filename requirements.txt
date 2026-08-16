@@ -1,6 +1,6 @@
 streamlit
 beautifulsoup4
-openai
+google-generativeai
 pydantic
 playwright
 playwright-stealth==1.0.6
