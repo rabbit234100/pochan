@@ -1,3 +1,6 @@
+import os
+os.system("playwright install chromium") #
+
 import streamlit as st
 import os
 import time
