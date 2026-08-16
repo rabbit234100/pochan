@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 # --- 1. 데이터 모델 정의 (Pydantic) ---
 class PokemonDetail(BaseModel):
@@ -53,24 +52,32 @@ init_db() # 앱 실행 시 DB가 없으면 생성
 # --- 3. 핵심 기능 함수 (크롤링 및 추출) ---
 def scrape_post(url: str, user_cookie: str = None) -> str:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # 봇 탐지 방지 플래그(args) 추가
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            ]
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080}
         )
         
-        # 관리자가 쿠키를 넘겨준 경우 브라우저에 주입
         if user_cookie:
             context.add_cookies([
                 {"name": "arca_session", "value": user_cookie.strip(), "domain": ".arca.live", "path": "/"}
             ])
             
         page = context.new_page()
-        stealth_sync(page)
+        # webdriver 감지 비활성화 스크립트 주입
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         try:
-            page.goto(url, wait_until="networkidle", timeout=20000)
-            time.sleep(2)
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            time.sleep(3)
             
             html = page.content()
             soup = BeautifulSoup(html, 'html.parser')
