@@ -6,7 +6,7 @@ import json
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
-from openai import OpenAI
+import google.generativeai as genai
 from playwright.sync_api import sync_playwright
 
 # --- 1. 데이터 모델 정의 (Pydantic) ---
@@ -101,29 +101,39 @@ def scrape_post(url: str, user_cookie: str = None) -> str:
             browser.close()
 
 def extract_giveaway_data(text: str, api_key: str) -> GiveawayExtraction:
-    client = OpenAI(api_key=api_key)
-    system_prompt = "포켓몬 커뮤니티의 '나눔' 게시글을 분석하여 누가 무엇을 받아갔는지 JSON으로 추출해."
-    response = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        response_format=GiveawayExtraction
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    system_prompt = "포켓몬 커뮤니티의 '나눔' 게시글을 분석하여 누가 무엇을 받아갔는지 추출해."
+    
+    response = model.generate_content(
+        f"{system_prompt}\n\n[게시글 내용]\n{text}",
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json",
+            response_schema=GiveawayExtraction,
+            temperature=0.1
+        )
     )
-    return response.choices[0].message.parsed
+    
+    data_dict = json.loads(response.text)
+    return GiveawayExtraction(**data_dict)
 
-# --- 4. Streamlit UI ---
+# --- 4. Streamlit UI 및 Secrets 설정 ---
 st.set_page_config(page_title="포켓몬 나눔 아카이브", layout="wide")
+
+# Streamlit 서버의 Secrets에서 Gemini API 키 불러오기
+try:
+    gemini_api_key = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    gemini_api_key = None
 
 # 사이드바 설정 및 메뉴 분리
 with st.sidebar:
-    st.header("🔑 설정")
-    openai_api_key = st.text_input("OpenAI API Key", type="password")
+    st.header("🔑 메뉴")
+    menu = st.radio("이동", ["유저: 나눔 기록하기", "관리자: 일괄 처리(Batch)"])
     
-    st.markdown("---")
-    # 탭을 이용해 유저 모드와 관리자 모드 전환
-    menu = st.radio("메뉴 이동", ["유저: 나눔 기록하기", "관리자: 일괄 처리(Batch)"])
+    if not gemini_api_key:
+        st.error("⚠️ 시스템 오류: 서버(Secrets)에 Gemini API 키가 설정되지 않았습니다.")
 
 # ----------------------------------------------------
 # [화면 1] 유저용 메인 화면
@@ -133,8 +143,8 @@ if menu == "유저: 나눔 기록하기":
     url_input = st.text_input("나눔 게시글 URL", placeholder="https://arca.live/b/pokemon/...")
     
     if st.button("내역 자동 추출하기", type="primary"):
-        if not openai_api_key:
-            st.error("👈 API 키를 먼저 입력해주세요.")
+        if not gemini_api_key:
+            st.error("서버에 API 키가 설정되지 않아 기능을 사용할 수 없습니다.")
         elif url_input:
             with st.spinner("분석 중입니다..."):
                 conn = get_db_connection()
@@ -159,7 +169,7 @@ if menu == "유저: 나눔 기록하기":
                     else:
                         # 성공 시 데이터 추출 및 DB 저장
                         try:
-                            extracted_data = extract_giveaway_data(raw_text, openai_api_key)
+                            extracted_data = extract_giveaway_data(raw_text, gemini_api_key)
                             conn.execute(
                                 'INSERT OR REPLACE INTO logs (url, status, data) VALUES (?, ?, ?)',
                                 (url_input, "COMPLETED", extracted_data.model_dump_json())
@@ -193,8 +203,7 @@ elif menu == "관리자: 일괄 처리(Batch)":
     
     admin_pw = st.text_input("관리자 비밀번호", type="password")
     
-    # 💡 실제 배포 시에는 st.secrets 에 비밀번호를 저장해두고 쓰는 것이 안전합니다.
-    if admin_pw == "rabbit777":  # 원하는 비밀번호로 변경하세요
+    if admin_pw == "rabbit777": 
         conn = get_db_connection()
         pending_logs = conn.execute('SELECT url FROM logs WHERE status = "FAILED_AUTH"').fetchall()
         
@@ -209,8 +218,8 @@ elif menu == "관리자: 일괄 처리(Batch)":
             if st.button("🔥 쿠키 장전 및 일괄 뚫기 실행", type="primary"):
                 if not admin_cookie:
                     st.error("쿠키를 입력해야 합니다.")
-                elif not openai_api_key:
-                    st.error("API 키를 입력해야 합니다.")
+                elif not gemini_api_key:
+                    st.error("서버에 API 키가 설정되지 않았습니다.")
                 else:
                     progress_text = "일괄 크롤링 중입니다. 잠시만 대기해주세요..."
                     my_bar = st.progress(0, text=progress_text)
@@ -227,7 +236,7 @@ elif menu == "관리자: 일괄 처리(Batch)":
                         
                         if "Error" not in raw_text and "로그인" not in raw_text:
                             try:
-                                extracted_data = extract_giveaway_data(raw_text, openai_api_key)
+                                extracted_data = extract_giveaway_data(raw_text, gemini_api_key)
                                 conn.execute(
                                     'UPDATE logs SET status = ?, data = ? WHERE url = ?',
                                     ("COMPLETED", extracted_data.model_dump_json(), target_url)
